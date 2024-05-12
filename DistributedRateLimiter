@@ -1,0 +1,506 @@
+package com.ddg.service;
+
+import com.dianping.cat.Cat;
+import com.dianping.cat.metrics.prometheus.builder.CounterBuilder;
+import com.google.common.util.concurrent.AtomicDouble;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.Pipeline;
+import redis.clients.jedis.Response;
+
+import javax.annotation.Resource;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Component
+public class DistributedRateLimiter implements InitializingBean {
+    /**
+     * 监控打点，其实应该叫ResourceKey更贴切，但这部分改名称涉及到所有监控打点的点位都要改一遍，先保持原样
+     */
+    private static final String METRIC_RESOURCE_TOKEN_GRANTED_COUNTER = "audit_op_service_name_qps_total";
+    private static final String LABEL_RESOURCE_KEY = "service_name";
+    private static final String LABEL_IS_LIMITED = "limited";
+
+    private final ScheduledExecutorService executorService = Executors.newSingleThreadScheduledExecutor();
+
+    /**
+     * 限流是否生效的观测手段，是基于prometheus打点的，prometheus打点有一个固定的采样率。
+     * 对于分布式限流，需要将窗口大小和打点采集的频率对齐，这样才能在打点数据上观察限流的效果，
+     * 和用户配置的限流阈值尽可能近似。
+     */
+    @Value("${model.scheduler.distributeRateLimit.windowSize:30}")
+    private int windowSize = 30;
+
+
+    @Value("${model-scheduler.rate-limiter.open:false}")
+    private volatile boolean enabled;
+
+    @Value("${model.scheduler.distributeRateLimit.logResourceKeys: auditonline-techcvgeneralocr-redscheduler}")
+    private Set<String> logResourceKeys;
+
+    /**
+     * 分布式限流的整个计算逻辑完全基于单机计算的话，会因环境差异及外部变化产生误差。
+     * 为了减少误差，我们引入redis去动态校准限流阈值
+     */
+    @Resource(name = "mlsysEcologyJedis")
+    private Jedis jedis;
+
+    private final Map<String, Limiter> limiters = new ConcurrentHashMap<>();
+
+    /**
+     * 保存同步的时间位置
+     */
+    private final AtomicLong syncTimeInSecond = new AtomicLong(0);
+
+    /**
+     * 尝试从限流器中获取一个token
+     * @param resourceKey 资源的key
+     * @param qps 限流的QPS
+     * @return token
+     */
+    public boolean tryAcquire(String resourceKey, int qps) {
+        // 判断开关是否开启，如果没有开启，直接返回一个随机的Token
+        if (!enabled) {
+            return true;
+        }
+
+        Limiter limiter = this.getLimiter(resourceKey);
+
+        limiter.setLogEnabled(logResourceKeys.contains(resourceKey));
+        limiter.setQps(qps);
+
+        boolean success = limiter.tryAcquireToken();
+        this.getCounterBuilder()
+                .addTag(LABEL_IS_LIMITED, Boolean.toString(!success))
+                .addTag(LABEL_RESOURCE_KEY, resourceKey)
+                .increment();
+
+        return success;
+    }
+
+    private CounterBuilder getCounterBuilder() {
+        return Cat.counter(METRIC_RESOURCE_TOKEN_GRANTED_COUNTER);
+    }
+
+    private Limiter getLimiter(String resourceKey) {
+        Limiter limiter = limiters.get(resourceKey);
+        if (limiter == null || limiter.getWindowSize() != this.windowSize) {
+            limiter = new Limiter(resourceKey, this.windowSize, this.jedis);
+            limiters.put(resourceKey, limiter);
+        }
+
+        return limiter;
+    }
+
+    @Override
+    public void afterPropertiesSet() {
+        executorService.scheduleAtFixedRate(() -> {
+            try (Pipeline pipeline = jedis.pipelined()) {
+                long currentInSecond = TimeUtil.getCurrentSecond();
+                if (this.syncTimeInSecond.getAndSet(currentInSecond) == currentInSecond) {
+                    return;
+                }
+
+                // 判断当前时间是否和windowSize的大小对齐，如果对齐则重新计算一下权重
+                if (currentInSecond % this.windowSize == 0) {
+                    this.limiters.values().forEach(limiter -> limiter.refresh(currentInSecond));
+                }
+
+                List<Runnable> postProcessors = this.limiters.values().stream()
+                        .map(limiter -> limiter.sync(currentInSecond, pipeline))
+                        .collect(Collectors.toList());
+                pipeline.sync();
+
+                postProcessors.forEach(Runnable::run);
+            } catch (Exception e) {
+                log.error("error in update rate limiter", e);
+            }
+        }, 0, 200, TimeUnit.MILLISECONDS);
+    }
+
+
+    @Data
+    static class Limiter {
+        /**
+         * redis中保存的每秒下发的token量的key的过期时间
+         */
+        private static final int COUNTER_EXPIRE_TIME_IN_SECOND = 60 * 60;
+
+        /**
+         * 上报本地数据至服务端的间隔时间（该参数是控制并发访问情况下，保证数据的准确性）
+         * 一般设置成2就够了
+         */
+        private static final int UPLOAD_DELAY_TIME_IN_SECOND = 2;
+        /**
+         * 通过redis计算集群已下发token量的延迟时间（该参数是为了防止网络传输抖动，导致计算不准确）
+         * 值的大小取决于数据更新到redis的延迟时间，一般5秒就足够了
+         */
+        private static final int CALCULATE_DELAY_TIME_IN_SECOND = 5;
+
+        /**
+         * 每轮刷新时，可以被留下来的最大token数量系数（基数是QPS）
+         */
+        private static final double MAX_REMAIN_RATE_BETWEEN_REFRESH = 8.0;
+
+        private final String resourceKey;
+
+        /**
+         * 窗口大小，对应会保存多大区间的统计数据
+         */
+        private final int windowSize;
+        /**
+         * 实际保存的每个位置的统计数据
+         */
+        private final Slot[] window;
+
+        /**
+         * 上报、下载集群整体下发的token数据，用于动态调整限流阈值
+         */
+        private final Jedis jedis;
+
+        /**
+         * 保存计算的时间位置
+         */
+        private final AtomicLong timeInSecond = new AtomicLong(0);
+
+        /**
+         * 当刷新后置为true，刷新过就不会清理掉历史积累的remain token数量
+         */
+        private final AtomicBoolean refreshed = new AtomicBoolean(true);
+
+        /**
+         * 当前实例的权重
+         */
+        private final AtomicDouble weight = new AtomicDouble(1.0);
+
+        /**
+         * 当前累计的剩余可以下发的token数量
+         */
+        private final AtomicDouble remain = new AtomicDouble(0.0);
+
+        /**
+         * 是否打印日志
+         */
+        private volatile boolean logEnabled;
+
+
+        /**
+         * 配置的集群下的qps限流值
+         */
+        private volatile double qps;
+
+        public Limiter(String resourceKey, int windowSize, Jedis jedis) {
+            this.resourceKey = resourceKey;
+            this.windowSize = windowSize;
+            this.window = new Slot[windowSize];
+            this.jedis = jedis;
+            for (int i = 0; i < windowSize; i++) {
+                window[i] = new Slot();
+            }
+        }
+
+        public boolean tryAcquireToken() {
+            Slot current = this.getOrUpdateSlot();
+            boolean success = current.tryAcquireToken();
+
+            // 更新当前剩余的token数量
+            this.remain.set(current.getRemain());
+            return success;
+        }
+
+        public Runnable sync(long currentInSecond, Pipeline pipeline) {
+            long upstreamTimeInSecond = currentInSecond - UPLOAD_DELAY_TIME_IN_SECOND;
+            Slot upstreamSlot = this.window[(int) (upstreamTimeInSecond % this.windowSize)];
+
+            // 需要判断下当前SLOT的数据是不是最新的数据，如果已经失效了，就不能再报到redis上
+            if (!upstreamSlot.isInstanceExpired(upstreamTimeInSecond, this.windowSize)) {
+                String redisKey = this.createRequestCountKey(upstreamTimeInSecond);
+                pipeline.incrBy(redisKey, upstreamSlot.getInstanceRequestCount());
+                pipeline.expire(redisKey, COUNTER_EXPIRE_TIME_IN_SECOND);
+            }
+
+            long downstreamTimeInSecond = currentInSecond - CALCULATE_DELAY_TIME_IN_SECOND;
+            Slot downstreamSlot = this.window[(int) (downstreamTimeInSecond % this.windowSize)];
+
+            pipeline.get(this.createRequestCountKey(downstreamTimeInSecond));
+            Response<String> requestCountResponse = pipeline.get(this.createRequestCountKey(downstreamTimeInSecond));
+            return () -> {
+                try {
+                    String value = requestCountResponse.get();
+                    long requestCount = value != null ? Long.parseLong(value) : 0;
+                    downstreamSlot.setClusterRequestCount((int) requestCount);
+
+                    downstreamSlot.setClusterTime(downstreamTimeInSecond);
+                } catch (Exception e) {
+                    log.error("error in update status", e);
+                }
+            };
+        }
+
+        private Slot getOrUpdateSlot() {
+            long currentInSecond = TimeUtil.getCurrentSecond();
+
+            Slot current = window[(int) (currentInSecond % windowSize)];
+            if (timeInSecond.getAndSet(currentInSecond) == currentInSecond) {
+                return current;
+            }
+
+            // 重新初始化当前数据
+            current.init(currentInSecond);
+
+            // 权重被重新计算过，在这个位置重新对齐遗留的token数量
+            if (refreshed.getAndSet(false)) {
+                double maxRemain = qps * weight.get() * MAX_REMAIN_RATE_BETWEEN_REFRESH;
+                if (this.logEnabled) {
+                    log.info(
+                            "Refresh remain token for [{}] of {} with max value {}",
+                            this.resourceKey, remain.get(), maxRemain
+                    );
+                }
+                remain.set(Math.min(remain.get(), maxRemain));
+            }
+            current.setLimit(qps * weight.get() + remain.get());
+
+            if (this.logEnabled) {
+                log.info("status for rate limit: [{}]-[{}:{}]", this, (int) (currentInSecond % windowSize), current);
+            }
+            return current;
+        }
+
+        public void refresh(long currentTimeInSecond) {
+            refreshed.getAndSet(true);
+
+            List<Slot> slotList = this.getClusterReleasedSlot(currentTimeInSecond);
+            long totalRequestCount = slotList.stream().mapToLong(Slot::getClusterRequestCount).sum();
+            long instanceRequestCount = slotList.stream().mapToLong(Slot::getInstanceRequestCount).sum();
+            if (this.logEnabled) {
+                log.info("Calculate weight for [{}], totalRequestCount: {}, instanceRequestCount: {}",
+                        this.resourceKey, totalRequestCount, instanceRequestCount);
+            }
+
+            if (totalRequestCount == 0) {
+                log.warn("totalRequestCount is 0, resourceKey: {}", this.resourceKey);
+                this.weight.set(1.0);
+                return;
+            }
+
+            if (instanceRequestCount == 0) {
+                log.warn("instanceRequestCount is 0, resourceKey: {}", this.resourceKey);
+                this.weight.set(1.0);
+                return;
+            }
+
+            this.weight.set((1.0 * instanceRequestCount) / totalRequestCount);
+        }
+
+        private String createRequestCountKey(long timeInSecond) {
+            return String.format("rate-limiter:request:%s:%d", this.resourceKey, timeInSecond);
+        }
+
+        private List<Slot> getClusterReleasedSlot(long currentInSecond) {
+            List<Slot> clusterReleasedSlot = new ArrayList<>();
+            for (long i = currentInSecond + 1; i < currentInSecond + this.windowSize - 1; i++) {
+                Slot slot = this.window[(int) (i % this.windowSize)];
+                if (slot.isClusterExpired(currentInSecond - 1, this.windowSize)) {
+                    continue;
+                }
+
+                clusterReleasedSlot.add(slot);
+            }
+
+            return clusterReleasedSlot;
+        }
+
+        @Override
+        public String toString() {
+            StringBuilder sb = new StringBuilder();
+            sb.append(this.resourceKey).append(" ");
+            sb.append(this.timeInSecond.get()).append(" ");
+            sb.append(this.timeInSecond.get() % this.windowSize).append(" ");
+
+            for (int i = 0; i < windowSize; i++) {
+                Slot slot = window[i];
+                sb.append(i).append(":")
+                        .append("(").append(this.timeInSecond.get() - slot.getInstanceTime()).append(")")
+                        .append("(").append(this.timeInSecond.get() - slot.getClusterTime()).append(")")
+                        .append(slot.getInstanceReleasedCount()).append("|")
+                        .append(slot.getInstanceRequestCount()).append("|")
+                        .append(slot.getClusterRequestCount());
+            }
+
+            return sb.toString();
+        }
+    }
+
+    static class Slot {
+        /**
+         * 是否已经耗尽所有的token
+         */
+        private volatile boolean exhausted = false;
+
+        /**
+         * 当前位置的限流阈值上限，当每秒中的第一个请求进来时会更新，之后变一直保持不变
+         */
+        private volatile double limit = 1000000.0;
+
+        /**
+         * 实例视角下，当前位置的时间（秒）
+         */
+        private volatile long instanceTime = 0;
+
+        /**
+         * 当前时间位置被请求了多少次
+         */
+        private volatile long instanceRequestCount = 0;
+
+        /**
+         * 当前位置下发了多少个token
+         */
+        private volatile long instanceReleasedCount = 0;
+
+        /**
+         * 集群视角下，当前位置对应的时间（秒）
+         */
+        private volatile long clusterTime = 0;
+
+        /**
+         * 集群视角下，一共在当前位置下发了多少token
+         */
+        private volatile long clusterRequestCount = 0;
+
+        public synchronized void init(long instanceTime) {
+            this.exhausted = false;
+            this.instanceRequestCount = 0;
+            this.instanceReleasedCount = 0;
+            this.instanceTime = instanceTime;
+        }
+
+        public synchronized void setLimit(double instanceLimit) {
+            this.limit = instanceLimit;
+        }
+
+        public synchronized boolean isInstanceExpired(long currentInSecond, int windowSize) {
+            if (this.instanceTime == 0) {
+                return true;
+            }
+
+            return currentInSecond - instanceTime >= windowSize;
+        }
+
+        public synchronized long getInstanceTime()   {
+            return instanceTime;
+        }
+
+        public synchronized long getInstanceRequestCount() {
+            return instanceRequestCount;
+        }
+
+        public synchronized void setClusterRequestCount(int clusterRequestCount) {
+            this.clusterRequestCount = clusterRequestCount;
+        }
+
+        public synchronized long getInstanceReleasedCount() {
+            return instanceReleasedCount;
+        }
+
+        public synchronized boolean isClusterExpired(long currentInSecond, int windowSize) {
+            if (this.clusterTime == 0) {
+                return true;
+            }
+
+            return currentInSecond - clusterTime >= windowSize;
+        }
+
+        public synchronized void setClusterTime(long clusterTime) {
+            this.clusterTime = clusterTime;
+        }
+
+        public synchronized long getClusterTime() {
+            return clusterTime;
+        }
+
+        public synchronized boolean tryAcquireToken() {
+            this.instanceRequestCount++;
+            if (this.exhausted) {
+                return false;
+            }
+
+            // 已经超发了，不能在发token下去了
+            if (this.instanceReleasedCount > this.limit) {
+                return false;
+            }
+
+            // 还很安全，自己这个token下发下去一定不会触发超发
+            if (this.instanceReleasedCount + 1 <= this.limit) {
+                this.instanceReleasedCount++;
+                return true;
+            }
+
+            // 表示已经耗尽所有的token了，直接拒绝后续的所有请求，以保证不会超发
+            this.exhausted = true;
+
+            double delta = this.limit - this.instanceReleasedCount;
+            if (Math.random() <= delta) {
+                this.instanceReleasedCount++;
+                return true;
+            }
+
+            return false;
+        }
+
+        public synchronized double getRemain() {
+            if (this.exhausted) {
+                return 0;
+            }
+
+            return this.limit - this.instanceReleasedCount;
+        }
+
+        public synchronized long getClusterRequestCount() {
+            return this.clusterRequestCount;
+        }
+
+        @Override
+        public String toString() {
+            return "(" + (TimeUtil.getCurrentSecond() - this.getInstanceTime()) + ")" +
+                    "(" + (TimeUtil.getCurrentSecond() - this.getClusterTime()) + ")" +
+                    this.limit + "|" +
+                    this.instanceReleasedCount + "|" +
+                    this.instanceRequestCount + "|" +
+                    this.clusterRequestCount;
+        }
+    }
+
+    static class TimeUtil {
+        private TimeUtil() {
+        }
+
+        private static final AtomicLong CURRENT_SECOND = new AtomicLong(System.currentTimeMillis() / 1000);
+
+        static {
+            ScheduledExecutorService executorService = Executors.newSingleThreadScheduledExecutor();
+            executorService.scheduleAtFixedRate(
+                    () -> CURRENT_SECOND.set(System.currentTimeMillis() / 1000),
+                    0, 1, TimeUnit.SECONDS
+            );
+        }
+
+        public static long getCurrentSecond() {
+            return CURRENT_SECOND.get();
+        }
+    }
+}
